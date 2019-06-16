@@ -10,6 +10,7 @@
 #include <iostream>
 #include <typeinfo>
 #include <algorithm>
+#include <unordered_map>
 
 #include <cxxabi.h>
 
@@ -29,6 +30,11 @@ struct CheckField
         using type = t;                 \
     };
 
+template <typename Field>
+struct FieldTypeGetter
+{
+    using type = typename Field::type;
+};
 //Some fields will be packed by tuple
 template <typename UpStream, typename SortFields, typename... Fields>
 class SortStream;
@@ -44,6 +50,16 @@ class SkipStream;
 //TODO: remove Fields
 template <typename UpStream, typename... Fields>
 class LimitStream;
+
+template <typename State, typename... Fields>
+struct Generator;
+
+template <typename State, typename... Fields>
+Generator<State, Fields...> make_generator(const typename Generator<State, Fields...>::func_type func,
+                                           const typename Generator<State, Fields...>::init_func_type init_func = []() -> State { return State{}; })
+{
+    return Generator<State, Fields...>(func, init_func);
+}
 
 void debug(IndexType<>)
 {
@@ -84,6 +100,56 @@ public:
             iter.next();
         }
     }
+
+    template <typename SelectFields, typename State>
+    struct GeneratorState
+    {
+        using key_t = typename MapTupleToTuple<FieldTypeGetter, SelectFields>::type;
+        std::unordered_map<key_t, State> table;
+        mutable typename std::unordered_map<key_t, State>::const_iterator iter;
+    };
+    //group by fields...
+    template <typename SelectFields, typename State, typename... OutFields>
+    Generator<GeneratorState<SelectFields, State>, OutFields...> aggerate_by(std::function<void(const typename MapTupleToTuple<FieldTypeGetter, SelectFields>::type &, State &, const typename Fields::type &...)> merge,
+                                                                             std::function<State(const typename MapTupleToTuple<FieldTypeGetter, SelectFields>::type &)> init,
+                                                                             std::function<std::tuple<typename OutFields::type...>(const typename MapTupleToTuple<FieldTypeGetter, SelectFields>::type &, const State &)> finish)
+    {
+        //FIXME:
+        using key_t = typename MapTupleToTuple<FieldTypeGetter, SelectFields>::type;
+        using value_t = std::tuple<typename OutFields::type...>;
+
+        auto gen_func = [finish](const GeneratorState<SelectFields, State> &state) -> std::pair<bool, value_t> {
+            auto &iter = state.iter;
+
+            if (iter != state.table.cend())
+            {
+                auto ret = finish(iter->first, iter->second);
+                iter++;
+                return {true, ret};
+            }
+            return {false, {}};
+        };
+        Derived upper = *static_cast<Derived *>(this);
+        auto init_func = [upper, merge, init]() mutable -> GeneratorState<SelectFields, State> {
+            std::unordered_map<key_t, State> table;
+            auto iter = upper.iterator();
+            while (iter)
+            {
+                auto value = iter.value();
+                using KeyIndex = typename TupleTypeIndicesInTypes<SelectFields, Fields...>::type;
+                auto key = tuple_select(value, KeyIndex{});
+                auto i = table.emplace(key, init(key)).first;
+                auto f = std::bind(merge, i->first, std::ref(i->second), std::placeholders::_1);
+                apply_all(f, value);
+                iter.next();
+            }
+            auto state = GeneratorState<SelectFields, State>{std::move(table), {}};
+            state.iter = state.table.cbegin();
+            return state;
+        };
+        return make_generator<GeneratorState<SelectFields, State>, OutFields...>(gen_func, init_func);
+    }
+
     template <typename Result>
     Result reduce(std::function<Result(const Result &, const typename Fields::type &...)> func, Result &&init)
     {
@@ -96,7 +162,6 @@ public:
         }
         return res;
     }
-
     template <typename Result, typename... ReduceFields>
     Result reduce_by(std::function<Result(const Result &, const typename ReduceFields::type &...)> func, Result &&init)
     {
@@ -111,16 +176,23 @@ public:
         }
         return c;
     }
-    MemoryTable<Fields...> collect()
+
+    template <typename... EmitFields>
+    std::shared_ptr<MemoryTable<EmitFields...>> collect()
     {
-        MemoryTable<Fields...> table;
+        auto table = MemoryTable<EmitFields...>::make();
         Iterator iter = iterator();
         while (iter)
         {
-            table.push(iter.value());
+            table->push(iter.value());
             iter.next();
         }
         return table;
+    }
+
+    std::shared_ptr<MemoryTable<Fields...>> collect()
+    {
+        return collect<Fields...>();
     }
 
     SkipStream<Derived, Fields...> skip(size_t step)
@@ -135,7 +207,7 @@ public:
     MapStream<Derived, SelectFields...> select()
     {
         return map<SelectFields...>([](const typename Fields::type &... vals) -> std::tuple<typename SelectFields::type...> {
-            return {std::get<TypeIndexInTuple<std::tuple<Fields...>, SelectFields>::value>(std::make_tuple(vals...))...};
+            return {std::get<TypeIndexInTuple<SelectFields, std::tuple<Fields...>>::value>(std::make_tuple(vals...))...};
         });
     }
 
@@ -233,7 +305,7 @@ struct MemoryTableIterator
 template <typename... Fields>
 class MemoryTableStream : public Stream<MemoryTableStream<Fields...>, MemoryTableIterator<Fields...>, Fields...>
 {
-    const MemoryTable<Fields...> *_ptr;
+    const std::shared_ptr<const MemoryTable<Fields...>> _ptr;
 
 public:
     using Iterator = MemoryTableIterator<Fields...>;
@@ -245,7 +317,7 @@ public:
     }
 
 public:
-    MemoryTableStream(const MemoryTable<Fields...> *mem_table) : _ptr(mem_table)
+    MemoryTableStream(std::shared_ptr<const MemoryTable<Fields...>> mem_table) : _ptr(mem_table)
     {
     }
     MemoryTableStream(const MemoryTableStream<Fields...> &other) = default;
@@ -477,12 +549,14 @@ struct GeneratorIterator
 {
     using value_type = std::tuple<typename Fields::type...>;
     using ret_type = std::pair<bool, value_type>;
-    using func_type = std::function<ret_type(State&)>;
+    using func_type = std::function<ret_type(State &)>;
+    using init_func_type = std::function<State()>;
     func_type _func;
     State _internal_state;
     ret_type _cache;
 
-    GeneratorIterator(func_type func, const State& init) : _func(func), _internal_state(init), _cache(_func(_internal_state)) {
+    GeneratorIterator(func_type func, init_func_type init_func) : _func(func), _internal_state(init_func()), _cache(_func(_internal_state))
+    {
     }
     GeneratorIterator(const GeneratorIterator<State, Fields...> &other) = default;
     GeneratorIterator(GeneratorIterator<State, Fields...> &&other) = default;
@@ -518,14 +592,17 @@ public:
     using Iterator = GeneratorIterator<State, Fields...>;
     using func_type = typename Iterator::func_type;
     using init_func_type = std::function<State()>;
+
 private:
     typename Iterator::func_type _func;
     init_func_type _init_func;
+
 public:
     Iterator iterator_impl()
     {
-        return Iterator(_func, _init_func());
+        return Iterator(_func, _init_func);
     }
+
 public:
     Generator(func_type func, init_func_type init_func) : _func(func), _init_func(init_func)
     {
@@ -536,12 +613,6 @@ public:
     Generator<State, Fields...> &operator=(const Generator<State, Fields...> &other) = default;
     Generator<State, Fields...> &operator=(Generator<State, Fields...> &&other) = default;
 };
-
-template<typename State, typename... Fields>
-Generator<State, Fields...> make_generator(const typename Generator<State, Fields...>::func_type func,
-                                           const typename Generator<State, Fields...>::init_func_type init_func=[]() -> State {return State{};}) {
-    return Generator<State, Fields...>(func, init_func);
-}
 
 template <typename UpStream, typename SortFields, typename... Fields>
 class SortStream : public Stream<SortStream<UpStream, SortFields, Fields...>, typename MemoryTableStream<Fields...>::Iterator, Fields...>
@@ -562,8 +633,8 @@ public:
             using IndexT = typename TupleTypeIndicesInTypes<SortFields, Fields...>::type;
             return apply(_func, a, b, IndexT{});
         };
-        std::sort(result._details.begin(), result._details.end(), func_wrapper);
-        return result.stream().iterator();
+        std::sort(result->_details.begin(), result->_details.end(), func_wrapper);
+        return result->stream().iterator();
     }
 
 public:
@@ -666,14 +737,25 @@ public:
 };
 
 template <typename... Fields>
-class MemoryTable
+class MemoryTable : public std::enable_shared_from_this<MemoryTable<Fields...>>
 {
 public:
     using __Checker = std::tuple<CheckField<Fields>...>;
-
-public:
     using value_type = std::tuple<typename Fields::type...>;
 
+public:
+    template <typename... Args>
+    static std::shared_ptr<MemoryTable<Fields...>> make(Args &&... values)
+    {
+        return std::shared_ptr<MemoryTable<Fields...>>{new MemoryTable<Fields...>(std::forward<Args>(values)...)};
+    }
+
+    static std::shared_ptr<MemoryTable<Fields...>> make(std::initializer_list<value_type> l)
+    {
+        return std::shared_ptr<MemoryTable<Fields...>>{new MemoryTable<Fields...>(l)};
+    }
+
+protected:
     MemoryTable()
     {
     }
@@ -682,10 +764,12 @@ public:
     MemoryTable(std::initializer_list<value_type> l) : _details(l)
     {
     }
-    ~MemoryTable() = default;
 
+public:
+    ~MemoryTable() = default;
     MemoryTable<Fields...> &operator=(MemoryTable &&other) = default;
     MemoryTable<Fields...> &operator=(const MemoryTable &other) = default;
+
     void emplace(const typename Fields::type &... args)
     {
         _details.emplace_back(args...);
@@ -704,7 +788,12 @@ public:
 
     MemoryTableStream<Fields...> stream() const
     {
-        return MemoryTableStream<Fields...>(this);
+        return MemoryTableStream<Fields...>(this->shared_from_this());
+    }
+
+    std::shared_ptr<MemoryTableStream<Fields...>> operator->() const
+    {
+        return std::make_shared<MemoryTableStream<Fields...>>(this->shared_from_this());
     }
 
     template <typename... Fields2>
@@ -713,33 +802,167 @@ public:
     template <typename UpStream, typename SortFields, typename... Fields2>
     friend class SortStream;
 
+    template <typename IndexFields, typename... Fields2>
+    friend class HashMemoryTableIndex;
+
+    //template<typename...HashFields>
+    //std::shared_ptr<HashMemoryTableIndex<std::tuple<HashFields...>, Fields...>> register_hash_index() {
+    //find or get
+    //}
+
 private:
     std::deque<value_type> _details;
+    //TODO
+    //std::unordered_map<int, std::shared_ptr<int>> _index;
 };
 
-template<typename State, typename Fields>
+template <typename IndexFields, typename... Fields>
+class HashMemoryTableIndex : public std::enable_shared_from_this<HashMemoryTableIndex<IndexFields, Fields...>>
+{
+public:
+    static_assert(std::tuple_size<IndexFields>::value > 0, "require 1 field at least");
+
+    //TODO: optimize while just one field
+    using key_type = typename MapTupleToTuple<FieldTypeGetter, IndexFields>::type;
+    using index_table = std::unordered_multimap<key_type, size_t>;
+    using range_type = std::pair<typename index_table::const_iterator, typename index_table::const_iterator>;
+
+public:
+    void reset(std::shared_ptr<MemoryTable<Fields...>> table)
+    {
+        //if (_table != table) {
+        //  _table->unsubscript(this->shared_from_this());
+        //  table->subscript(this->shared_from_this());
+        //}
+        _table = table;
+        build_index();
+    }
+
+    void build_index()
+    {
+        _index.clear();
+        size_t count = 0;
+        for (const auto &value : _table->_details)
+        {
+            using KeyIndex = typename TupleTypeIndicesInTypes<IndexFields, Fields...>::type;
+            auto key = tuple_select(value, KeyIndex{});
+            _index.emplace(tuple_select(value, KeyIndex{}), count++);
+        }
+    }
+
+    range_type find(const key_type &key) const
+    {
+        return _index.equal_range(key);
+    }
+
+    //return true if success, constraint check here
+    bool add(const key_type &key) const
+    {
+        //TODO: implementation
+        return true;
+    }
+    template <typename... Keys>
+    range_type find(const Keys &... key) const
+    {
+        return find(key_type{key...});
+    }
+
+private:
+    //multi
+    index_table _index;
+    //TODO: generator HashMemoryTableIndexFrom _table
+    std::shared_ptr<MemoryTable<Fields...>> _table;
+};
+
+template <typename Arg>
+struct SharedPtrOf
+{
+    using type = std::shared_ptr<Arg>;
+};
+
+template <typename FieldsTuple>
+struct CheckIndexFields {
+    static_assert(std::tuple_size<FieldsTuple>::value > 0, "Index fields size should be more than zero");
+};
+
+template <typename IndexTypes, typename... Fields>
+class IndexManager : public std::enable_shared_from_this<IndexManager<IndexTypes, Fields...>>
+{
+public:
+    template <typename FieldsTuple>
+    using __CheckerFields = std::tuple<ForEachTuple<CheckField, FieldsTuple>, CheckIndexFields<FieldsTuple>>;
+    using __CheckersForFields = typename ForEachTuple<__CheckerFields, IndexTypes>::type;
+
+    using index_tuple = typename MapTupleToTuple<SharedPtrOf, IndexTypes>::type;
+
+private:
+    static_assert(IsTuple<IndexTypes>::value, "IndexTypes should be tuple of tuple<Fields...>");
+
+    using self_t = IndexManager<IndexTypes, Fields...>;
+
+    template <typename... IndexFields>
+    using __need_create_t = std::integral_constant<bool, (TypeIndexInTuple<std::tuple<IndexFields...>, IndexTypes>::value >= std::tuple_size<IndexTypes>::value)>;
+
+    template <typename... IndexFields>
+    using __after_create_t = IndexManager<typename CombineTuple2<IndexTypes, std::tuple<std::tuple<IndexFields...>>>::type, Fields...>;
+
+public:
+    template <typename... IndexFields>
+    typename std::enable_if<!__need_create_t<IndexFields...>::value, std::shared_ptr<self_t>>::type create_index()
+    {
+        return this->shared_from_this();
+    }
+
+    template <typename... IndexFields>
+    typename std::enable_if<__need_create_t<IndexFields...>::value, std::shared_ptr<__after_create_t<IndexFields...>>>::type create_index()
+    {
+        return std::make_shared<__after_create_t<IndexFields...>>();
+    }
+
+    static std::string debug()
+    {
+        std::string out = abi::__cxa_demangle(typeid(self_t).name(), NULL, NULL, NULL);
+        return out;
+    }
+
+private:
+    //index_tuple _indices;
+};
+
+template <typename State, typename Fields>
 struct GeneratorTraits;
 
-template<typename State, typename...Fields>
-struct GeneratorTraits <State, std::tuple<Fields...>> {
+template <typename State, typename... Fields>
+struct GeneratorTraits<State, std::tuple<Fields...>>
+{
     using type = Generator<State, Fields...>;
 };
 
-template<typename Stream1, typename Stream2>
-struct CombineStreamState {
+template <typename Stream1, typename Stream2>
+struct CombineStreamState
+{
     Stream1 stream1;
     Stream2 stream2;
     typename Stream1::Iterator iter_a;
     typename Stream2::Iterator iter_b;
+
+    CombineStreamState(Stream1 &&s1, Stream2 &&s2) : stream1(std::forward<Stream1>(s1)), stream2(std::forward<Stream2>(s2)), iter_a(stream1.iterator()), iter_b(stream2.iterator())
+    {
+    }
+
+    CombineStreamState(const Stream1 &s1, const Stream2 &s2) : stream1(s1), stream2(s2), iter_a(stream1.iterator()), iter_b(stream2.iterator())
+    {
+    }
 };
-template<typename Stream1, typename Stream2>
+template <typename Stream1, typename Stream2>
 using CombineGenerator = typename GeneratorTraits<CombineStreamState<Stream1, Stream2>, typename CombineTuple<typename Stream1::field_types, typename Stream2::field_types>::type>::type;
 
-template<typename Stream1, typename Stream2>
-auto combine_stream(Stream1&& stream1, Stream2&& stream2) -> CombineGenerator<Stream1, Stream2> {
+template <typename Stream1, typename Stream2>
+auto combine_stream(Stream1 &&stream1, Stream2 &&stream2) -> CombineGenerator<Stream1, Stream2>
+{
     using value_type = typename CombineGenerator<Stream1, Stream2>::value_type;
     using state_type = CombineStreamState<Stream1, Stream2>;
-    return CombineGenerator<Stream1, Stream2>([](state_type & state) -> std::pair<bool, value_type> {
+    return CombineGenerator<Stream1, Stream2>([](state_type &state) -> std::pair<bool, value_type> {
         while (state.iter_a) {
             if (state.iter_b) {
                 auto res = std::tuple_cat(state.iter_a.value(), state.iter_b.value());
@@ -752,10 +975,7 @@ auto combine_stream(Stream1&& stream1, Stream2&& stream2) -> CombineGenerator<St
                 return {false, {}};
             }
         }
-        return {false, {}};
-    }, [&stream1, &stream2]() -> state_type {
-        return {stream1, stream2, stream1.iterator(), stream2.iterator()};
-    });
+        return {false, {}}; }, [&stream1, &stream2]() -> state_type { return {stream1, stream2}; });
 }
 
 #endif //MEM_TABLE_H
