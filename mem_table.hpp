@@ -828,6 +828,12 @@ public:
     using range_type = std::pair<typename index_table::const_iterator, typename index_table::const_iterator>;
 
 public:
+    HashMemoryTableIndex(std::shared_ptr<MemoryTable<Fields...>> table) : _index(), _table(table)
+    {
+        build_index();
+    }
+
+public:
     void reset(std::shared_ptr<MemoryTable<Fields...>> table)
     {
         //if (_table != table) {
@@ -840,6 +846,7 @@ public:
 
     void build_index()
     {
+        std::cout << "build index: " << debug() << std::endl;
         _index.clear();
         size_t count = 0;
         for (const auto &value : _table->_details)
@@ -848,6 +855,12 @@ public:
             auto key = tuple_select(value, KeyIndex{});
             _index.emplace(tuple_select(value, KeyIndex{}), count++);
         }
+    }
+
+    static std::string debug()
+    {
+        std::string out = abi::__cxa_demangle(typeid(HashMemoryTableIndex<IndexFields, Fields...>).name(), NULL, NULL, NULL);
+        return out;
     }
 
     range_type find(const key_type &key) const
@@ -881,7 +894,8 @@ struct SharedPtrOf
 };
 
 template <typename FieldsTuple>
-struct CheckIndexFields {
+struct CheckIndexFields
+{
     static_assert(std::tuple_size<FieldsTuple>::value > 0, "Index fields size should be more than zero");
 };
 
@@ -889,22 +903,51 @@ template <typename IndexTypes, typename... Fields>
 class IndexManager : public std::enable_shared_from_this<IndexManager<IndexTypes, Fields...>>
 {
 public:
+    template <typename... IndexFields>
+    using has_index = std::integral_constant<bool, (TypeIndexInTuple<std::tuple<IndexFields...>, IndexTypes>::value < std::tuple_size<IndexTypes>::value)>;
+
     template <typename FieldsTuple>
     using __CheckerFields = std::tuple<ForEachTuple<CheckField, FieldsTuple>, CheckIndexFields<FieldsTuple>>;
     using __CheckersForFields = typename ForEachTuple<__CheckerFields, IndexTypes>::type;
+    template <typename IndexFields>
+    struct __GetHashMemoryTableIndex
+    {
+        using type = std::shared_ptr<HashMemoryTableIndex<IndexFields, Fields...>>;
+    };
 
-    using index_tuple = typename MapTupleToTuple<SharedPtrOf, IndexTypes>::type;
+    using index_tuple = typename MapTupleToTuple<__GetHashMemoryTableIndex, IndexTypes>::type;
+
+    IndexManager(std::shared_ptr<MemoryTable<Fields...>> table) : _table(table)
+    {
+        init_all_index<std::tuple_size<index_tuple>::value>();
+    }
 
 private:
+    IndexManager() : _table(nullptr) {}
+
+    template <size_t N, typename std::enable_if<(N > 0), int>::type = 0>
+    void init_all_index()
+    {
+        init_all_index<N - 1>();
+        using index_ptr = typename std::tuple_element<N - 1, index_tuple>::type;
+        std::get<N>(_indices) = std::make_shared<typename index_ptr::element_type>(_table);
+    }
+
+    template <size_t N, typename std::enable_if<!(N > 0), int>::type = 0>
+    void init_all_index() {}
+
     static_assert(IsTuple<IndexTypes>::value, "IndexTypes should be tuple of tuple<Fields...>");
 
     using self_t = IndexManager<IndexTypes, Fields...>;
 
     template <typename... IndexFields>
-    using __need_create_t = std::integral_constant<bool, (TypeIndexInTuple<std::tuple<IndexFields...>, IndexTypes>::value >= std::tuple_size<IndexTypes>::value)>;
+    using __need_create_t = std::integral_constant<bool, !has_index<IndexFields...>::value>;
 
     template <typename... IndexFields>
     using __after_create_t = IndexManager<typename CombineTuple2<IndexTypes, std::tuple<std::tuple<IndexFields...>>>::type, Fields...>;
+
+    template<typename Types, typename...>
+    friend class IndexManager;
 
 public:
     template <typename... IndexFields>
@@ -916,7 +959,11 @@ public:
     template <typename... IndexFields>
     typename std::enable_if<__need_create_t<IndexFields...>::value, std::shared_ptr<__after_create_t<IndexFields...>>>::type create_index()
     {
-        return std::make_shared<__after_create_t<IndexFields...>>();
+        auto manager = std::shared_ptr<__after_create_t<IndexFields...>>(new __after_create_t<IndexFields...>());
+        auto index = std::make_shared<HashMemoryTableIndex<std::tuple<IndexFields...>, Fields...>>(_table);
+        manager->_indices = std::tuple_cat(this->_indices, std::make_tuple(index));
+        manager->_table = _table;
+        return manager;
     }
 
     static std::string debug()
@@ -926,7 +973,8 @@ public:
     }
 
 private:
-    //index_tuple _indices;
+    std::shared_ptr<MemoryTable<Fields...>> _table;
+    index_tuple _indices;
 };
 
 template <typename State, typename Fields>

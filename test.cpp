@@ -55,10 +55,10 @@ int main()
             }
         });
 
-    HashMemoryTableIndex<std::tuple<HEAD_name>, HEAD_name, HEAD_zzz, HEAD_name2> index;
+    HashMemoryTableIndex<std::tuple<HEAD_name>, HEAD_name, HEAD_zzz, HEAD_name2> index(a);
     index.reset(a);
 
-    auto manager = std::make_shared<IndexManager<std::tuple<>, HEAD_name, HEAD_zzz, HEAD_name2>>();
+    auto manager = std::make_shared<IndexManager<std::tuple<>, HEAD_name, HEAD_zzz, HEAD_name2>>(a);
     auto new_manager = manager->create_index<HEAD_name>()->create_index<HEAD_name2>();
     std::cout << __LINE__ << std::endl;
     //new_manager->create_index<>();
